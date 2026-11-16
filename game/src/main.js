@@ -9,7 +9,7 @@
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 import { mulberry32 } from './rng.js';
-import { createWorld, MAP, WAYPOINTS, losClear } from './world.js';
+import { createWorld, MAP, WAYPOINTS, losClear, groundHeightAt, findRoute } from './world.js';
 import { createInput } from './input.js';
 import { createPlayer } from './player.js';
 import {
@@ -95,8 +95,8 @@ const game = {
   frozen: false,
 };
 
-const DEFENDER_ROUTES = [[12, 14, 13], [13, 14, 12], [15, 9, 12], [16, 11, 13]];
-const ATTACKER_ROUTES = [[0, 3, 6, 9, 12], [2, 5, 8, 11, 13]];
+const DEFENDER_ROUTES = [[24, 26, 25], [25, 26, 24], [15, 22, 24], [16, 20, 25]];
+const ATTACKER_ROUTES = [[0, 3, 8, 11, 14, 17, 21, 24], [2, 5, 10, 13, 16, 19, 23, 25]];
 
 function buildBots() {
   for (const bot of game.bots) scene.remove(bot.group);
@@ -104,14 +104,14 @@ function buildBots() {
   MAP.defenderSpawn.forEach((spawn, i) => {
     game.bots.push(createBot(scene, {
       name: `Jackal-${i + 1}`, team: 'defender', spawn,
-      route: DEFENDER_ROUTES[i], yaw: Math.PI,
+      route: DEFENDER_ROUTES[i], yaw: Math.PI / 2,
     }));
   });
   MAP.attackerSpawn.forEach((spawn, i) => {
     if (i === 1) return; // the player takes the middle spawn
     game.bots.push(createBot(scene, {
       name: `Viper-${i + 2}`, team: 'attacker', spawn,
-      route: ATTACKER_ROUTES[i === 0 ? 0 : 1], yaw: 0,
+      route: ATTACKER_ROUTES[i === 0 ? 0 : 1], yaw: -Math.PI / 2,
     }));
   });
 }
@@ -151,10 +151,15 @@ function botContext() {
     events: game.events,
     enemies: (bot) => enemyList(bot),
     coverNode: (bot) => {
-      // The waypoint farthest from the nearest visible enemy.
+      // The waypoint farthest from the nearest visible enemy, on the same
+      // side of the canal as the bot (crossing nodes count for either side),
+      // so a hurt bot never has to cross a bridge while falling back.
+      const side = bot.group.position.x < 0 ? -1 : 1;
       let bestNode = 0;
       let bestDist = -1;
       for (let i = 0; i < WAYPOINTS.length; i += 1) {
+        const nodeSide = WAYPOINTS[i].x === 0 ? side : (WAYPOINTS[i].x < 0 ? -1 : 1);
+        if (nodeSide !== side) continue;
         let d = Infinity;
         for (const e of enemyList(bot)) {
           d = Math.min(d, Math.hypot(WAYPOINTS[i].x - e.pos.x, WAYPOINTS[i].z - e.pos.z));
@@ -320,8 +325,10 @@ function stepGrenades(dt) {
     const g = game.grenades[i];
     g.vel.y -= 9.8 * dt;
     g.pos.addScaledVector(g.vel, dt);
-    if (g.pos.y < 0.1) {
-      g.pos.y = 0.1;
+    // The floor under a grenade: the yard, the deck ramp or the deck top.
+    const floor = groundHeightAt(g.pos.x, g.pos.z) + 0.1;
+    if (g.pos.y < floor) {
+      g.pos.y = floor;
       g.vel.y = Math.abs(g.vel.y) * 0.45;
       g.vel.x *= 0.7;
       g.vel.z *= 0.7;
@@ -411,7 +418,7 @@ function issueCommand(cmd) {
     if (mate) hud.squadLine(`${mate.name}: Copy, moving to mark.`);
     return;
   }
-  for (const mate of mates) mate.order = cmd;
+  for (const mate of mates) { mate.order = cmd; mate.rushRoute = null; mate.rushRouteIndex = 0; }
   audio.ack();
   hud.feed(`You: ${COMMANDS[cmd].label}`);
   const mate = mates[0];
@@ -448,7 +455,7 @@ function startRound() {
   for (const mesh of grenadeMeshes) scene.remove(mesh);
   grenadeMeshes.length = 0;
   resetBomb(bomb, MAP.site);
-  player.teleport(MAP.attackerSpawn[1].x, MAP.attackerSpawn[1].z, 0);
+  player.teleport(MAP.attackerSpawn[1].x, MAP.attackerSpawn[1].z, -Math.PI / 2);
   const loadout = game.loadout;
   for (const key of Object.keys(loadout.guns)) {
     const gun = loadout.guns[key];
@@ -842,6 +849,7 @@ function frame(now) {
       hud.setCrosshairSpread(4 + spread * 700);
     }
     syncCamera();
+    world.step(dt);
   }
   renderer.render(scene, camera);
 }
@@ -937,13 +945,13 @@ function runShot(name) {
   player.state.pitch = 0;
   player.state.yaw = 0;
   if (name === 'start') {
-    player.teleport(0, 13.5, -0.12);
+    player.teleport(-19, 0, -Math.PI / 2);
     const bot = game.bots[0];
-    bot.group.position.set(0, 0, -7);
-    bot.yaw = Math.PI;
-    bot.group.rotation.y = Math.PI;
+    bot.group.position.set(-8, 0, 0);
+    bot.yaw = Math.PI / 2;
+    bot.group.rotation.y = Math.PI / 2;
     settle(20);
-    aimAt(new THREE.Vector3(0, 1.4, -11));
+    aimAt(new THREE.Vector3(0, 1.4, 0));
     hud.showOverlay('start', 'RAILYARD 9', 'Night shift on the freight yard. Plant the spike at Site A — or wipe the Jackals out. Win the round, earn cash, buy better steel.', 'Click to play');
   } else if (name === 'play') {
     // Give the player the rifle and stage a mid-combat frame: one kill, one
@@ -953,21 +961,21 @@ function runShot(name) {
     game.loadout.guns.rifle.reserve = 90;
     game.loadout.current = 'rifle';
     game.money = 3400;
-    player.teleport(0, 2, 0.1);
+    player.teleport(-4, 0, -Math.PI / 2);
     const enemy = game.bots[0];
     enemy.hp = 34; // one rifle headshot (68) drops them — a clean staged kill
-    enemy.group.position.set(1.5, 0, -6);
-    enemy.yaw = Math.PI;
-    enemy.group.rotation.y = Math.PI;
+    enemy.group.position.set(2, 0, 0);
+    enemy.yaw = Math.PI / 2;
+    enemy.group.rotation.y = Math.PI / 2;
     enemy.order = 'hold';
     const mate = game.bots.find((b) => b.team === 'attacker');
-    mate.group.position.set(-5.5, 0, -2.5);
+    mate.group.position.set(-6, 0, -3);
     mate.yaw = -0.9;
     mate.group.rotation.y = -0.9;
     const defender2 = game.bots[1];
-    defender2.group.position.set(-6, 0, -9);
-    defender2.yaw = Math.PI;
-    defender2.group.rotation.y = Math.PI;
+    defender2.group.position.set(6, 0, -9.5);
+    defender2.yaw = 2.33;
+    defender2.group.rotation.y = 2.33;
     settle(10);
     // Fire until the first enemy drops (spread 0 in shot mode via aimAt).
     for (let i = 0; i < 5 && enemy.alive; i += 1) {
@@ -1006,11 +1014,11 @@ function runShot(name) {
     game.scoreA = 1;
     for (const bot of game.bots) {
       if (bot.team === 'defender') {
-        bot.group.position.set(12, 0, 10);
+        bot.group.position.set(-12, 0, 10);
         bot.order = 'hold';
       }
     }
-    player.teleport(0, -8.5, Math.PI);
+    player.teleport(13, -4, Math.PI);
     bomb.state = 'planted';
     bomb.fuse = 18;
     bomb.group.position.set(MAP.site.x, 0.05, MAP.site.z);
@@ -1034,6 +1042,9 @@ window.__fps = {
   game,
   player,
   bomb,
+  waypoints: WAYPOINTS,
+  colliders: world.colliders,
+  findRoute,
   setLook(yaw, pitch) {
     player.state.yaw = yaw;
     player.state.pitch = pitch;

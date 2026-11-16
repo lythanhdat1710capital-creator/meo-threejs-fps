@@ -1,7 +1,7 @@
 // Player: first-person movement with acceleration, friction, crouching,
 // jumping and collision against the world's AABBs. Stopping to aim pays:
 // spread grows with speed, crouching shrinks it.
-import { resolveCircle } from './world.js';
+import { resolveCircle, groundHeightAt } from './world.js';
 
 const EYE_STAND = 1.62;
 const EYE_CROUCH = 1.05;
@@ -60,8 +60,8 @@ export function createPlayer(colliders, spawn) {
     iz /= len;
     const sin = Math.sin(state.yaw);
     const cos = Math.cos(state.yaw);
-    const wx = (ix * cos - iz * sin) * speed;
-    const wz = (ix * sin + iz * cos) * speed;
+    const wx = (ix * cos + iz * sin) * speed;
+    const wz = (-ix * sin + iz * cos) * speed;
 
     const k = Math.min(1, ACCEL * dt);
     state.velocity.x += (wx - state.velocity.x) * k;
@@ -81,12 +81,21 @@ export function createPlayer(colliders, spawn) {
     state.position.x += state.velocity.x * dt;
     state.position.z += state.velocity.z * dt;
     state.position.y += state.velocity.y * dt;
-    if (state.position.y <= 0) {
-      state.position.y = 0;
+    // The ground under the feet: the yard floor, the deck ramp, or the deck
+    // top. Walking up the ramp lifts the player; walking off the deck edge
+    // drops them back to the floor.
+    const ground = groundHeightAt(state.position.x, state.position.z);
+    if (state.position.y <= ground) {
+      state.position.y = ground;
       state.velocity.y = 0;
       state.onGround = true;
+    } else {
+      state.onGround = false;
     }
-    resolveCircle(colliders, state.position, RADIUS);
+    // Collision is height-aware: a box whose top is at or below the feet
+    // (plus a small step-up allowance) does not push — that is what lets
+    // the player stand on the loading deck.
+    resolveCircle(colliders, state.position, RADIUS, state.position.y);
     const speed2d = Math.hypot(state.velocity.x, state.velocity.z);
     state.stance = !state.onGround ? 'air' : speed2d < 0.8 ? 'idle' : state.crouched ? 'crouch' : walking ? 'walk' : 'run';
     // Recoil recovery is owned by main.js: it decays slowly while spraying

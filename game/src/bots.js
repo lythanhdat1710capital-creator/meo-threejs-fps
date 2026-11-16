@@ -6,7 +6,7 @@
 // back to a safe node and peek). Bots never allocate in their hot step.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
-import { losClear, resolveCircle } from './world.js';
+import { losClear, resolveCircle, findRoute } from './world.js';
 
 const BOT_RADIUS = 0.36;
 const WALK_SPEED = 3.1;
@@ -94,6 +94,10 @@ export function createBot(scene, opts) {
     plantTimer: 0,
     defuseTimer: 0,
     hasBomb: false,
+    bombRoute: null,         // waypoint route to the site, via findRoute
+    bombRouteIndex: 0,
+    rushRoute: null,         // waypoint route for a rush order
+    rushRouteIndex: 0,
     speed2d: 0,
     order: null,                // squad order: 'follow' | 'hold' | 'rush' | null
     spotted: false,             // true while the current target is called out
@@ -141,6 +145,14 @@ function moveToward(bot, colliders, tx, tz, dt, speed) {
   bot.speed2d = speed;
   resolveCircle(colliders, bot.group.position, BOT_RADIUS);
   return false;
+}
+
+// Walk one node of a waypoint route; returns true when the route is done.
+function followRoute(bot, ctx, route, indexKey, dt, speed) {
+  const node = ctx.waypoints[route[bot[indexKey]]];
+  const arrived = moveToward(bot, ctx.colliders, node.x, node.z, dt, speed);
+  if (arrived) bot[indexKey] += 1;
+  return bot[indexKey] >= route.length;
 }
 
 export function stepBot(bot, dt, ctx) {
@@ -210,7 +222,15 @@ export function stepBot(bot, dt, ctx) {
     const dist = Math.hypot(tp.x - pos.x, tp.z - pos.z);
     // Face the target.
     bot.yaw = Math.atan2(-(tp.x - pos.x), -(tp.z - pos.z));
-    // Strafe while shooting; close in when too far, back off when too close.
+    // Strafe while shooting; close in from mid range (a bot that only strafes
+    // at 15 m stalls in a standoff — attackers must push across the bridges,
+    // not hold an angle across the canal), back off when too close.
+    // The bomb carrier — and a rushing attacker — pushes through a fight
+    // instead of holding a strafing range: otherwise the carrier reaches
+    // the bridge mouth, sees a defender, and strafes there forever without
+    // ever crossing the canal. Defenders never push (they hold).
+    const pushing = bot.team === 'attacker' && (bot.hasBomb || bot.order === 'rush');
+    const closeIn = pushing ? 4 : 12;
     bot.strafeTimer -= dt;
     if (bot.strafeTimer <= 0) {
       bot.strafeTimer = 0.9 + Math.random() * 1.1;
@@ -218,7 +238,7 @@ export function stepBot(bot, dt, ctx) {
     }
     let mx = 0;
     let mz = 0;
-    if (dist > 22) {
+    if (dist > closeIn) {
       mx = tp.x - pos.x;
       mz = tp.z - pos.z;
     } else if (dist < 7) {
@@ -262,10 +282,13 @@ export function stepBot(bot, dt, ctx) {
       const d = Math.hypot(fp.x - pos.x, fp.z - pos.z);
       if (d > 3.5) moveToward(bot, ctx.colliders, fp.x, fp.z, dt, ALERT_SPEED);
     } else if (bot.order === 'rush') {
-      // Rush the site: straight at it, fast.
-      const site = ctx.site;
-      const d = Math.hypot(site.x - pos.x, site.z - pos.z);
-      if (d > site.half) moveToward(bot, ctx.colliders, site.x, site.z, dt, ALERT_SPEED);
+      // Rush the site via the waypoint graph — a straight line would beach
+      // the bot on the canal wall.
+      if (!bot.rushRoute) {
+        bot.rushRoute = findRoute(pos.x, pos.z, ctx.site.x, ctx.site.z);
+        bot.rushRouteIndex = 0;
+      }
+      followRoute(bot, ctx, bot.rushRoute, 'rushRouteIndex', dt, ALERT_SPEED);
     } else {
       // Patrol: walk the route, pausing briefly at each node.
       const node = waypoints[bot.route[bot.routeIndex % bot.route.length]];
@@ -283,12 +306,18 @@ export function stepBot(bot, dt, ctx) {
     }
   }
 
-  // Bomb carrier bot: walk the route to the site and plant.
+  // Bomb carrier bot: walk the waypoint route to the site and plant.
+  // The route crosses the canal on a bridge (or the ford), never straight
+  // through the water — a straight line would beach the carrier on the wall.
   if (bot.hasBomb && bot.team === 'attacker' && bot.state !== 'attack') {
     const site = ctx.site;
     const d = Math.hypot(site.x - pos.x, site.z - pos.z);
     if (d > site.half) {
-      moveToward(bot, ctx.colliders, site.x, site.z, dt, ALERT_SPEED);
+      if (!bot.bombRoute) {
+        bot.bombRoute = findRoute(pos.x, pos.z, site.x, site.z);
+        bot.bombRouteIndex = 0;
+      }
+      followRoute(bot, ctx, bot.bombRoute, 'bombRouteIndex', dt, ALERT_SPEED);
     } else {
       bot.plantTimer += dt;
       ctx.events.push({ type: 'botPlanting', bot, progress: bot.plantTimer });
@@ -351,6 +380,10 @@ export function resetBot(bot, spawn, route) {
   bot.plantTimer = 0;
   bot.defuseTimer = 0;
   bot.hasBomb = false;
+  bot.bombRoute = null;
+  bot.bombRouteIndex = 0;
+  bot.rushRoute = null;
+  bot.rushRouteIndex = 0;
   bot.order = null;
   bot.spotted = false;
   bot.bar.visible = true;
